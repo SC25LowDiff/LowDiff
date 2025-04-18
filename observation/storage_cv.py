@@ -14,24 +14,24 @@ from deepspeed import comm as dist
 
 # Argument parsing
 parser = argparse.ArgumentParser(description='DeepSpeed ImageNet Training with TopK Compression')
-parser.add_argument('--dataset', default='imagenet', type=str, help='Dataset name')
-parser.add_argument('--model', default='resnet101', type=str, help='Model architecture')
-parser.add_argument('--epochs', default=1, type=int, help='Number of epochs to run')
-parser.add_argument('--batch-size', default=64, type=int, help='Batch size per GPU')
+parser.add_argument('--dataset', default='imagenet', type=str, help='dataset name')
+parser.add_argument('--model', default='resnet101', type=str, help='model architecture')
+parser.add_argument('--epochs', default=1, type=int, help='number of epochs to run')
+parser.add_argument('--batch-size', default=64, type=int, help='batch size per GPU')
 parser.add_argument('--lr', '--learning-rate', default=0.0125, type=float, dest='lr')
-parser.add_argument('--momentum', default=0.9, type=float, help='Momentum')
-parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float, help='Weight decay')
-parser.add_argument('--workers', default=1, type=int, help='Data loading workers')
-parser.add_argument('--seed', type=int, default=42, help='Seed for initializing training')
+parser.add_argument('--momentum', default=0.9, type=float, help='momentum')
+parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float, help='weight decay')
+parser.add_argument('--workers', default=1, type=int, help='data loading workers')
+parser.add_argument('--seed', type=int, default=42, help='seed for initializing training')
 parser.add_argument('--compress_ratio', default=0.01, type=float, help='TopK compression ratio')
-parser.add_argument('--local_rank', type=int, default=0, help='Local rank for distributed training')
-parser.add_argument("--compressor", default="topk", type=str, help='Which compressor to use')
-parser.add_argument("--compressor_ratio", default=0.01, type=float, help='Choose compress ratio for compressor')
-parser.add_argument("--save-dir", default='/save_dir', type=str, help='Directory to save checkpoints')
-parser.add_argument("--resume", type=int, default=0, help='Resume from checkpoint')
-parser.add_argument("--diff", action="store_true", help='Whether to use differential ckpt')
-parser.add_argument("--freq", default=0, type=int, help='How many iterations to save a full checkpoint')
-parser.add_argument("--save-batch-freq", default='1', type=int, help='In-memory batching frequency')
+parser.add_argument('--local_rank', type=int, default=0, help='local rank for distributed training')
+parser.add_argument("--compressor", default="topk", type=str, help='which compressor to use')
+parser.add_argument("--compressor_ratio", default=0.01, type=float, help='choose compress ratio for compressor')
+parser.add_argument("--save-dir", default='/data/lowdiff', type=str, help='directory to save checkpoints')
+parser.add_argument("--resume", type=int, default=0, help='resume from checkpoint')
+parser.add_argument("--diff", action="store_true", help='whether to use differentail ckpt')
+parser.add_argument("--freq", default=0, type=int, help='how many iteration to save a full checkpoint')
+parser.add_argument("--save-batch-freq", default='1', type=int, help='in-memory batching frequency')
 
 args = parser.parse_args()
 
@@ -113,35 +113,53 @@ def main():
             model.step()
             end = time.time()
             if dist.get_rank() == 0:
-                print("Iteration takes {:.3f}s".format(end - begin))
+                print("iteration takes {:.3f}s".format(end - begin))
 
+            # save full ckpt
             if dist.get_rank() == 0 and args.freq > 0 and batch_idx % args.freq == 0:
                         begin_full = time.time()
                         torch.save({
                             'epoch': epoch + 1,
                             'model': model.module.state_dict(),
-                            'optimizer': optimizer.state_dict(),
-                        }, '{}/{}_full_optimizer.pth.tar'.format(args.save_dir, args.model))
+                            'optimizer' : optimizer.state_dict(),
+                        }, '{}/{}_full_optimizer.pth.tar'.format(args.save_dir,args.model))
                         end_full = time.time()
-                        print("Base checkpoint takes {:.3f}s".format(end_full - begin_full))
-                        
-            if batch_idx != 0 and dist.get_rank() == 0: 
+                        print("base checkpoint takes {:.3f}s".format(end_full - begin_full))
+            
+            # save gradient for observe gradient size
+            if dist.get_rank() == 0 and batch_idx ==0 :
                 begin = time.time()
-                compress_diff = compress_model_and_optimizer(model.module, prev_model, optimizer.state_dict(), prev_optimizer)
+                gradients = {}
+                # Save gradients for each parameter in the model
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        gradients[name] = param.grad.cpu()
+                torch.save(gradients, '{}/{}_gradients.pth.tar'.format(args.save_dir,args.model))
+                end = time.time()
+                print("save gradients takes {:.3f}s".format(end - begin))
+                 
+            if batch_idx !=0 and dist.get_rank() == 0: 
+                begin = time.time()
+                # compress_diff = compress_model_and_optimizer(model.module,prev_model,optimizer.state_dict(),prev_optimizer)
+                compress_diff = compress_model(model.module,prev_model)
+                
             
             if dist.get_rank() == 0:
+                # prev_model = copy.deepcopy(model.module).cpu()
                 prev_model = copy.deepcopy(model.module)
-                prev_optimizer = copy.deepcopy(model.optimizer.state_dict())
+                # prev_optimizer = _to_cpu(copy.deepcopy(model.optimizer.state_dict()))
+                # prev_optimizer = copy.deepcopy(model.optimizer.state_dict())
             
-            if batch_idx != 0 and dist.get_rank() == 0: 
+            if batch_idx !=0 and dist.get_rank() == 0: 
                 end = time.time()
-                print("Compress model takes {:.3f}s".format(end - begin))
+                print("compress model takes {:.3f}s".format(end - begin))
                 
-            if batch_idx != 0 and dist.get_rank() == 0: 
+            if batch_idx !=0 and dist.get_rank() == 0: 
                 begin = time.time()
-                torch.save(compress_diff, '{}/{}_diff.pth.tar'.format(args.save_dir, args.model))
+                # torch.save(compress_diff, '{}/{}_diff.pth.tar'.format(args.save_dir,args.model))
+                torch.save((compress_diff,model.optimizer.state_dict()), '{}/{}_diff.pth.tar'.format(args.save_dir,args.model))
                 end = time.time()
-                print("Save diff takes {:.3f}s".format(end - begin))
+                print("save diff takes {:.3f}s".format(end - begin))
 
         print(f"Epoch {epoch} completed.")
     
@@ -195,6 +213,24 @@ def _to_cuda(data):
     else:
         return data
 
+def compress_model(model_a, model_b):
+    model_b = model_b.cuda()
+    compressed_data = {
+        'model': {},
+    }
+    for (name, param_a) in model_a.state_dict().items():
+        param_b = model_b.state_dict()[name]
+        if torch.is_tensor(param_a):
+            diff = (param_a - param_b).to(param_a.device)
+            indices, values, shape = topk_compress(diff)
+            compressed_data['model'][name] = {
+                'indices': indices,
+                'values': values,
+                'shape': shape
+            }
+    
+    return compressed_data
+
 def compress_model_and_optimizer(model_a, model_b, optimizer_a, optimizer_b):
     model_b = model_b.cuda()
     optimizer_b = _to_cuda(optimizer_b)
@@ -204,7 +240,6 @@ def compress_model_and_optimizer(model_a, model_b, optimizer_a, optimizer_b):
         'optimizer': {}
     }
 
-    # Calculate and compress the difference of model parameters
     for (name, param_a) in model_a.state_dict().items():
         param_b = model_b.state_dict()[name]
         if torch.is_tensor(param_a):
@@ -216,7 +251,6 @@ def compress_model_and_optimizer(model_a, model_b, optimizer_a, optimizer_b):
                 'shape': shape
             }
 
-    # Calculate and compress the difference of optimizer states
     state_a = optimizer_a['state']
     state_b = optimizer_b['state']
 
@@ -233,7 +267,6 @@ def compress_model_and_optimizer(model_a, model_b, optimizer_a, optimizer_b):
                     'shape': shape
                 }
             else:
-                # Save non-tensor data directly
                 compressed_data['optimizer'][group_idx][state_key] = state_val_a
 
     return compressed_data

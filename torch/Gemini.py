@@ -1,3 +1,5 @@
+# We implement Gemini as checkfreq style with Ramdisk for checkpointing
+
 import os
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))

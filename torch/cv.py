@@ -6,6 +6,7 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
+# import torch.distributed as dist
 import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.transforms as transforms
@@ -33,7 +34,7 @@ parser.add_argument('--compress_ratio', default=0.01, type=float, help='TopK com
 parser.add_argument('--local_rank', type=int, default=0, help='local rank for distributed training')
 parser.add_argument("--compressor", default="topk", type=str, help='which compressor to use')
 parser.add_argument("--compressor_ratio", default=0.01, type=float, help='choose compress ratio for compressor')
-parser.add_argument("--save-dir", default='/save_dir', type=str, help='directory to save checkpoints')
+parser.add_argument("--save-dir", default='/data/lowdiff', type=str, help='directory to save checkpoints')
 parser.add_argument("--resume", type=int, default=0, help='resume from checkpoint')
 parser.add_argument("--diff", action="store_true", help='whether to use differentail ckpt')
 parser.add_argument("--freq", default=0, type=int, help='how many iteration to save a full checkpoint')
@@ -199,6 +200,8 @@ def find_max():
 def load_differential_checkpoint(model, optimizer):
     filedir = args.save_dir
     _parameter_names = {name: param for name, param in model.named_parameters()}
+    # skip synchronize
+    # with optimizer.skip_synchronize():
     iterations = find_max()
     for i in range(0, iterations):
         filepath = filedir + '/{}_{}_{}_{}_{}-{}_batch1.pth.tar'.format(args.model, args.dataset, args.compressor, args.compressor_ratio, args.resume-1, i)
@@ -228,6 +231,8 @@ def load_batch_differential_checkpoint(model, optimizer):
             print("loaded interation {}".format(i))
     return model, optimizer
 
+
+# bugs need be fixed
 def sync_model_optimizer_state(model, optimizer):
     # Only execute synchronization on rank 0
     if dist.get_rank() == 0:

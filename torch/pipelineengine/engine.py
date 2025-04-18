@@ -373,44 +373,51 @@ class PipelineEngine(DeepSpeedEngine):
                 # PP+BF16 work for ZeRO Stage 1
                 self._bf16_reduce_grads()
             else:
+                
+                # Use manual compression to verify feasibility
                 self.allreduce_gradients(bucket_size=MEMORY_OPT_ALLREDUCE_SIZE)
+                grads, _ = self._get_gradients_for_reduction()
+                flat_grads = torch.cat([g.view(-1) for g in grads])
+                compressed_grads = self.topk_compress(flat_grads)
+                self.queue.put((compressed_grads,'/data/lowdiff/pipe/pipe_'+str(dist.get_local_rank())+'_'+str(self.i),self.i))
+        
+        # with bugs need to be fixed  
+        # else:
+        #     grads, _ = self._get_gradients_for_reduction()
+        #     dp_group = self.mpu.get_data_parallel_group()
+        #     # dp_world_size = dist.get_world_size(dp_group)
+        #     compressed_grads = []
+        #     for grad_data in grads:
+        #         indices, values = self.topk_compress(grad_data)
+        #         compressed_grads.append((indices, values))
                 
-        else:
-            grads, _ = self._get_gradients_for_reduction()
-            dp_group = self.mpu.get_data_parallel_group()
-            # dp_world_size = dist.get_world_size(dp_group)
-            compressed_grads = []
-            for grad_data in grads:
-                indices, values = self.topk_compress(grad_data)
-                compressed_grads.append((indices, values))
-                
-            gathered_indices = []
-            gathered_values = []
+        #     gathered_indices = []
+        #     gathered_values = []
 
-            for i, (indices, values) in enumerate(compressed_grads):
-                # Use sparse_all_gather for each compressed gradient
-                gathered_indices.append(self.sparse_all_gather(indices, dp_group))
-                gathered_values.append(self.sparse_all_gather(values, dp_group))
+        #     for i, (indices, values) in enumerate(compressed_grads):
+        #         # Use sparse_all_gather for each compressed gradient
+        #         gathered_indices.append(self.sparse_all_gather(indices, dp_group))
+        #         gathered_values.append(self.sparse_all_gather(values, dp_group))
 
             
-            # Step 3: Restore the gradients using scatter_add_
-            for i, (indices, values) in enumerate(zip(gathered_indices, gathered_values)):
-                # diff ckpt
-                self.diff_ckpt[dist.get_local_rank()][str(i)] = {'values': values, 'indices': indices, 'shape': grads[i].size()}
+        #     # Step 3: Restore the gradients using scatter_add_
+        #     for i, (indices, values) in enumerate(zip(gathered_indices, gathered_values)):
+        #         # diff ckpt
+        #         self.diff_ckpt[dist.get_local_rank()][str(i)] = {'values': values, 'indices': indices, 'shape': grads[i].size()}
                 
-                # Initialize an empty tensor to hold the restored gradients
-                restored_grad = torch.zeros_like(grads[i]).view(-1)
+        #         # Initialize an empty tensor to hold the restored gradients
+        #         restored_grad = torch.zeros_like(grads[i]).view(-1)
 
-                # Scatter and add the gathered values to the corresponding positions
-                for idx, val in zip(indices, values):
-                    restored_grad.scatter_add_(0, idx, val)  # Scatter add
+        #         # Scatter and add the gathered values to the corresponding positions
+        #         for idx, val in zip(indices, values):
+        #             restored_grad.scatter_add_(0, idx, val)  # Scatter add
 
-                # Assign the restored gradient back to the original gradient tensor
-                grads[i] = restored_grad.view(grads[i].size())
+        #         # Assign the restored gradient back to the original gradient tensor
+        #         grads[i] = restored_grad.view(grads[i].size())
 
-            self.queue.put((self.diff_ckpt[dist.get_local_rank()],'/data/ycx/lowdiff/pipe/vgg19_pipe_'+str(dist.get_local_rank())+'_'+str(self.i),self.i))
+        #     self.queue.put((self.diff_ckpt[dist.get_local_rank()],'/data/lowdiff/pipe/vgg19_pipe_'+str(dist.get_local_rank())+'_'+str(self.i),self.i))
             
-        self._force_grad_boundary = False
+        # self._force_grad_boundary = False
 
     def _bf16_reduce_grads(self):
         self.buffered_allreduce_fallback(grads=None, elements_per_buffer=MEMORY_OPT_ALLREDUCE_SIZE)

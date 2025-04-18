@@ -14,7 +14,7 @@ COMPRESSOR=topk
 COMPRESSOR_RATIO=0.01
 FREQ=5
 SAVE_BATCH_FREQ=5 
-SAVE_DIR=/save_dir/
+SAVE_DIR=/data/ob
 RESUME=0
 
 # Distributed training with DeepSpeed

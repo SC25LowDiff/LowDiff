@@ -6,24 +6,27 @@ export MASTER_PORT=29500
 export NCCL_IB_DISABLE=1
 
 # Training parameters
-DATASET=imagenet
-MODEL=resnet101
+DATASET=wikitext-2
+MODEL=gpt2-large
 EPOCHS=10
-BATCH_SIZE=64
+BATCH_SIZE=4
 COMPRESSOR=topk
-COMPRESS_RATIO=0.01
-DIFF=false
-FREQ=0
-PACK=1
+COMPRESSOR_RATIO=0.01
+FREQ=100
+SAVE_BATCH_FREQ=20
+SAVE_DIR=/data/lowdiff
+RESUME=0
 
 # Distributed training with DeepSpeed
-deepspeed --hostfile=hostfile cv.py \
+deepspeed --hostfil=gpt_hostfile ./torch/GPT.py \
   --dataset $DATASET \
   --model $MODEL \
   --epochs $EPOCHS \
   --batch-size $BATCH_SIZE \
   --compressor $COMPRESSOR \
-  --compressor_ratio $COMPRESS_RATIO \
-  --diff $DIFF \
+  --compressor_ratio $COMPRESSOR_RATIO \
+  --diff \
   --freq $FREQ \
-  --pack $PACK
+  --save-batch-freq $SAVE_BATCH_FREQ \
+  --save-dir $SAVE_DIR \
+  --resume $RESUME

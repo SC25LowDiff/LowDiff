@@ -10,9 +10,9 @@ DATASET=cifar100
 MODEL=resnet50
 EPOCHS=10
 BATCH_SIZE=64
-FREQ=10
-SAVE_DIR=/save_dir
-RESUME=0
+COMPRESSOR=topk
+COMPRESSOR_RATIO=0.01
+SAVE_DIR=/data/checkfreq
 
 # Distributed training with DeepSpeed
 deepspeed --hostfil=hostfile ./torch/checkfreq.py \
@@ -20,6 +20,6 @@ deepspeed --hostfil=hostfile ./torch/checkfreq.py \
   --model $MODEL \
   --epochs $EPOCHS \
   --batch-size $BATCH_SIZE \
-  --freq $FREQ \
-  --save-dir $SAVE_DIR \
-  --resume $RESUME
+  --compressor $COMPRESSOR \
+  --compressor_ratio $COMPRESSOR_RATIO \
+  --save-dir $SAVE_DIR 

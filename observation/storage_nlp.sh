@@ -14,11 +14,12 @@ COMPRESSOR=topk
 COMPRESSOR_RATIO=0.01
 FREQ=5
 SAVE_BATCH_FREQ=1
-SAVE_DIR=/save_dir
+SAVE_DIR=/data/ob
 RESUME=0
 
 # Distributed training with DeepSpeed
-deepspeed --hostfile=hostfile storage_nlp.py \
+# deepspeed --hostfil=hostfile test.py
+deepspeed --hostfil=hostfile storage_nlp.py \
   --dataset $DATASET \
   --model $MODEL \
   --epochs $EPOCHS \

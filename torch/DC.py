@@ -1,7 +1,5 @@
-import os
-import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 import time
+import copy
 import argparse
 import torch
 import torch.nn as nn
@@ -13,27 +11,24 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 import deepspeed
 from deepspeed import comm as dist
-from communicator.comm import Communicator
-import torch.multiprocessing as mp
-mp.set_start_method('spawn',force=True)
-import copy
 
 # Argument parsing
 parser = argparse.ArgumentParser(description='DeepSpeed ImageNet Training with TopK Compression')
-parser.add_argument('--dataset', default='imagenet', type=str, help='Dataset name')
-parser.add_argument('--model', default='resnet101', type=str, help='Model architecture')
-parser.add_argument('--epochs', default=1, type=int, help='Number of epochs to run')
-parser.add_argument('--batch-size', default=64, type=int, help='Batch size per GPU')
+parser.add_argument('--dataset', default='imagenet', type=str, help='dataset name')
+parser.add_argument('--model', default='resnet101', type=str, help='model architecture')
+parser.add_argument('--epochs', default=1, type=int, help='number of epochs to run')
+parser.add_argument('--batch-size', default=64, type=int, help='batch size per GPU')
 parser.add_argument('--lr', '--learning-rate', default=0.0125, type=float, dest='lr')
-parser.add_argument('--momentum', default=0.9, type=float, help='Momentum')
-parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float, help='Weight decay')
-parser.add_argument('--workers', default=1, type=int, help='Data loading workers')
-parser.add_argument('--seed', type=int, default=42, help='Seed for initializing training')
-parser.add_argument('--local_rank', type=int, default=0, help='Local rank for distributed training')
-parser.add_argument("--save-dir", default='/save_dir', type=str, help='Directory to save checkpoints')
-parser.add_argument("--resume", type=int, default=0, help='Resume from checkpoint')
-parser.add_argument("--freq", default=0, type=int, help='How many iterations to save a full checkpoint')
-parser.add_argument("--diff", default=0, type=int, help='How many iterations to save a diff checkpoint')
+parser.add_argument('--momentum', default=0.9, type=float, help='momentum')
+parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float, help='weight decay')
+parser.add_argument('--workers', default=1, type=int, help='data loading workers')
+parser.add_argument('--seed', type=int, default=42, help='seed for initializing training')
+parser.add_argument('--compress_ratio', default=0.01, type=float, help='TopK compression ratio')
+parser.add_argument('--local_rank', type=int, default=0, help='local rank for distributed training')
+parser.add_argument("--compressor", default="topk", type=str, help='which compressor to use')
+parser.add_argument("--compressor_ratio", default=0.01, type=float, help='choose compress ratio for compressor')
+parser.add_argument("--save-dir", default='/data/lowdiff', type=str, help='directory to save checkpoints')
+parser.add_argument("--freq", default=0, type=int, help='how many iteration to save a full checkpoint')
 
 args = parser.parse_args()
 
@@ -89,11 +84,7 @@ def main():
         return
     
     model.cuda()
-    optimizer = optim.Adam(model.parameters(), lr=0.0001)
-    
-    # optionally resume from a checkpoint at rank 0, then broadcast weights to other workers
-    if args.resume and dist.get_rank() == 0:
-        model, optimizer = load_base_checkpoint(model,optimizer)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
     
     # Define the configuration dictionary directly in code
     ds_config = {
@@ -103,12 +94,6 @@ def main():
     
     # Initialize DeepSpeed
     model, optimizer, _, _ = deepspeed.initialize(model=model, optimizer=optimizer, model_parameters=model.parameters(), config=ds_config)
-    model.enable_backward_allreduce = False
-    
-     # Use the Communicator class
-    communicator = Communicator(model)
-    communicator.register_hooks()
-    
     criterion = nn.CrossEntropyLoss()
     
     # Training loop
@@ -117,18 +102,15 @@ def main():
         train_loader.sampler.set_epoch(epoch)
 
         for batch_idx, (images, targets) in enumerate(train_loader):
-            end = time.time()
+            begin = time.time()
             images, targets = images.cuda(), targets.cuda()
-            
             output = model(images)
             loss = criterion(output, targets)
             model.backward(loss)
-            communicator.decompress()
             model.step()
-
+            end = time.time()
             if dist.get_rank() == 0:
-                print("[Epoch {}/{}] Batch {}, Loss: {:.3f}, Time: {:.3f}"
-                    .format(epoch, args.epochs, batch_idx, loss.item(), time.time() - end))
+                print("iteration takes {:.3f}s".format(end - begin))
 
             if dist.get_rank() == 0 and args.freq > 0 and batch_idx % args.freq == 0:
                         begin_full = time.time()
@@ -136,42 +118,30 @@ def main():
                             'epoch': epoch + 1,
                             'model': model.module.state_dict(),
                             'optimizer' : optimizer.state_dict(),
-                        }, '{}/{}_{}_full_optimizer.pth.tar'.format(args.save_dir,args.model,batch_idx))
+                        }, '{}/{}_full_optimizer.pth.tar'.format(args.save_dir,args.model))
                         end_full = time.time()
-                        print("Base checkpoint takes {:.3f}s".format(end_full - begin_full))
+                        print("base checkpoint takes {:.3f}s".format(end_full - begin_full))
                         
-            if batch_idx !=0 and dist.get_rank() == 0 and batch_idx % args.diff == 0: 
+            if batch_idx !=0 and dist.get_rank() == 0: 
                 begin = time.time()
-                compress_diff = compress_model_and_optimizer(model.module,prev_model,optimizer.state_dict(),prev_optimizer)
-                prev_model = copy.deepcopy(model.module)
-                prev_optimizer = copy.deepcopy(model.optimizer.state_dict())
-                begin = time.time()
-                torch.save(compress_diff, '{}/{}_{}_{}_diff.pth.tar'.format(args.save_dir,args.model,args.diff,batch_idx))
-                end = time.time()
-                print("Save diff takes {:.3f}s".format(end - begin))
+                compress_diff = DC_with_compress(model.module,prev_model)
             
-            if batch_idx == 0:
-                # Save the initial model and optimizer state
-                prev_model = copy.deepcopy(model.module)
-                prev_optimizer = copy.deepcopy(model.optimizer.state_dict())
+            if dist.get_rank() == 0:
+                prev_model = copy.deepcopy(model.module).cpu()
+                # prev_model = copy.deepcopy(model.module)
+            
+            if batch_idx !=0 and dist.get_rank() == 0: 
+                end = time.time()
+                print("compress model takes {:.3f}s".format(end - begin))
+                
+            if batch_idx !=0 and dist.get_rank() == 0: 
+                begin = time.time()
+                torch.save((compress_diff,model.optimizer.state_dict()), '{}/{}_diff.pth.tar'.format(args.save_dir,args.model))
+                end = time.time()
+                print("save diff takes {:.3f}s".format(end - begin))
 
         print(f"Epoch {epoch} completed.")
-
-def load_base_checkpoint(model, optimizer):
-    start = time.time()
-    filedir = args.save_dir
-    filepath = filedir + '/' + args.model + '_' + args.dataset + '_' + args.compressor + '_' + str(args.compressor_ratio) + '_' + str(args.resume-1) + '_0_full' + '.pth.tar'
-    if os.path.isfile(filepath):
-        print("Loading {}".format(filepath))
-        checkpoint = torch.load(filepath)
-        model.load_state_dict(checkpoint['model'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        end = time.time()
-        print("Load base checkpoint takes {:.3f}s".format(end - start))
-        return model, optimizer
-    else:
-        raise ValueError("No checkpoint found")
-
+    
 def topk_compress(tensor):
     """
     Compress the gradient into Top-K format.
@@ -222,16 +192,14 @@ def _to_cuda(data):
     else:
         return data
 
-def compress_model_and_optimizer(model_a, model_b, optimizer_a, optimizer_b):
+def DC_with_compress(model_a, model_b):
     model_b = model_b.cuda()
-    optimizer_b = _to_cuda(optimizer_b)
     
     compressed_data = {
         'model': {},
         'optimizer': {}
     }
-
-    # Calculate and compress the difference of model parameters
+    
     for (name, param_a) in model_a.state_dict().items():
         param_b = model_b.state_dict()[name]
         if torch.is_tensor(param_a):
@@ -242,28 +210,6 @@ def compress_model_and_optimizer(model_a, model_b, optimizer_a, optimizer_b):
                 'values': values,
                 'shape': shape
             }
-    }
-
-    # Calculate and compress the difference of optimizer states
-    state_a = optimizer_a['state']
-    state_b = optimizer_b['state']
-
-    for group_idx in state_a.keys():
-        compressed_data['optimizer'][group_idx] = {}
-        for state_key, state_val_a in state_a[group_idx].items():
-            state_val_b = state_b[group_idx][state_key]
-            if torch.is_tensor(state_val_a):
-                diff = (state_val_a - state_val_b).to(state_val_a.device)
-                indices, values, shape = topk_compress(diff)
-                compressed_data['optimizer'][group_idx][state_key] = {
-                    'indices': indices,
-                    'values': values,
-                    'shape': shape
-                }
-            else:
-                # Save non-tensor data directly
-                compressed_data['optimizer'][group_idx][state_key] = state_val_a
-        }
 
     return compressed_data
     

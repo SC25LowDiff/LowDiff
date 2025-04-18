@@ -25,7 +25,6 @@ from transformers import (
     set_seed
 )
 
-
 # Argument parsing
 parser = argparse.ArgumentParser(description='DeepSpeed NLP Training with TopK Compression')
 parser.add_argument('--dataset', default='wikitext-2', type=str, help='dataset name')
@@ -41,31 +40,34 @@ parser.add_argument('--compress_ratio', default=0.01, type=float, help='TopK com
 parser.add_argument('--local_rank', type=int, default=0, help='local rank for distributed training')
 parser.add_argument("--compressor", default="topk", type=str, help='which compressor to use')
 parser.add_argument("--compressor_ratio", default=0.01, type=float, help='choose compress ratio for compressor')
-parser.add_argument("--save-dir", default='/save_dir', type=str, help='directory to save checkpoints')
+parser.add_argument("--save-dir", default='/data/lowdiff', type=str, help='directory to save checkpoints')
 parser.add_argument("--resume", type=int, default=0, help='resume from checkpoint')
-parser.add_argument("--diff", action="store_true", help='whether to use differentail ckpt')
-parser.add_argument("--freq", default=0, type=int, help='how many iteration to save a full checkpoint')
+parser.add_argument("--diff", action="store_true", help='whether to use differential checkpoint')
+parser.add_argument("--freq", default=0, type=int, help='how many iterations to save a full checkpoint')
 parser.add_argument("--save-batch-freq", default='1', type=int, help='in-memory batching frequency')
 parser.add_argument("--seq_length", type=int, default=512)  
 parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-parser.add_argument("--parellel_recovery", type=bool, default=true, help='whether to use parellel recovery')
+parser.add_argument("--parellel_recovery", type=bool, default=True, help='whether to use parallel recovery')
 args = parser.parse_args()
 
 
 def main():
+    # Initialize argument parsing
     model_path = "/data/dataset/nlp/openai-community/" + args.model
 
+    # Initialize DeepSpeed distributed training
     deepspeed.init_distributed()
     dist.barrier()
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
-    set_seed(42 + rank)  
+    set_seed(42 + rank)  # Set deterministic seed
     torch.cuda.set_device(args.local_rank)
     print(f"[Rank {rank}/{world_size}] Initialized DeepSpeed")
 
+    # Load dataset and tokenizer
     tokenizer = GPT2Tokenizer.from_pretrained(model_path)
     print("Tokenizer loaded successfully.")
-    tokenizer.pad_token = tokenizer.eos_token  
+    tokenizer.pad_token = tokenizer.eos_token  # Set padding token
     
     def tokenize_function(examples):
         return tokenizer(
@@ -75,6 +77,7 @@ def main():
             padding="max_length"
         )
 
+    # Load and process the wikitext-103 dataset
     if args.dataset == 'wikitext-103':
         dataset = load_dataset("/data/dataset/nlp/transformer/wikitext-103", 
                         data_files={
@@ -100,12 +103,14 @@ def main():
         num_proc=12
     )
 
-    print("Dataset map successfully.")
+    print("Dataset mapping completed successfully.")
+    # Data collator (auto-generates labels)
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
-        mlm=False  
+        mlm=False  # Use causal language modeling
     )
 
+    # Distributed sampler
     train_sampler = DistributedSampler(
         tokenized_dataset,
         shuffle=True,
@@ -121,6 +126,7 @@ def main():
         num_workers=4
     )
 
+    # Initialize model (enable gradient checkpointing to save memory)
     print("Loading model...")
     if args.model == 'gpt2':
         model = GPT2LMHeadModel.from_pretrained("/data/dataset/nlp/openai-community/gpt2")
@@ -129,7 +135,7 @@ def main():
     elif args.model == 'gpt2-large':
         model = GPT2LMHeadModel.from_pretrained("/data/dataset/nlp/openai-community/gpt2-large")
     else:
-        print("Model loaded fail.")
+        print("Model loading failed.")
     model.gradient_checkpointing_enable()  
     model.cuda()
     print("Model loaded successfully.")
@@ -146,7 +152,7 @@ def main():
         },
     }
     model, optimizer, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=ds_config)
-    # optionally resume from a checkpoint at rank 0, then broadcast weights to other workers
+    # Optionally resume from a checkpoint at rank 0, then broadcast weights to other workers
     if args.resume and dist.get_rank() == 0:
 
         model, optimizer = load_base_checkpoint(model,optimizer)
@@ -157,13 +163,10 @@ def main():
                 model, optimizer = new_load_differential_checkpoint(model,optimizer, args.compress_ratio, args)
             else:
                 model, optimizer = load_differential_checkpoint(model,optimizer)
-        
     
     model.cuda()
 
-    deepspeed.enable_backward_allreduce = False
-    
-     # Use the Communicator class
+    # Use the Communicator class
     communicator = Communicator(model, k=args.compress_ratio, save_batch_freq=args.save_batch_freq)
     communicator.register_hooks()
 
@@ -195,7 +198,7 @@ def main():
                             'optimizer' : optimizer.state_dict(),
                         }, '{}/{}_{}_{}_{}_{}_{}_full.pth.tar'.format(args.save_dir,args.model,args.dataset,args.compressor,args.compressor_ratio,epoch,batch_idx))
                         end_full = time.time()
-                        print("base checkpoint takes {:.3f}s".format(end_full - begin_full))
+                        print("Base checkpoint takes {:.3f}s".format(end_full - begin_full))
 
             end = time.time()
 
@@ -206,165 +209,3 @@ def load_base_checkpoint(model, optimizer):
     filedir = args.save_dir
     filepath = filedir + '/' + args.model + '_' + args.dataset + '_' + args.compressor + '_' + str(args.compressor_ratio) + '_' + str(args.resume-1) + '_0_full' + '.pth.tar'
     if os.path.isfile(filepath):
-        print("loading {}".format(filepath))
-        checkpoint = torch.load(filepath)
-        model.load_state_dict(checkpoint['model'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        end = time.time()
-        print("load base checkpoint takes {:.3f}s".format(end - start))
-        return model, optimizer
-    else:
-        raise ValueError("No checkpoint found")
-
-def topk_decompress(values, indices, shape):
-    tensor_decompressed = torch.zeros(shape).cuda().view(-1)
-    for idx, val in zip(indices, values):
-        tensor_decompressed = tensor_decompressed.scatter_add_(0, idx, val)
-    return tensor_decompressed.view(shape)
-
-def find_max():
-    files = os.listdir(args.save_dir)
-    if args.save_batch_freq>1:
-        pattern = r'{}_{}_{}_{}_{}-(\d+)_batch{}\.pth\.tar'.format(args.model, args.dataset, args.compressor, args.compressor_ratio, args.resume-1, args.save_batch_freq)
-    else:
-        pattern = r'{}_{}_{}_{}_{}-(\d+)_batch1\.pth\.tar'.format(args.model, args.dataset, args.compressor, args.compressor_ratio, args.resume-1)
-    max_x = -1
-    for file in files:
-        match = re.match(pattern, file)
-        if match:
-            x = int(match.group(1))
-            if x > max_x:
-                max_x = x
-    if max_x != -1:
-        print("Max diff ckpt at epoch {}, iteration {}".format(args.resume, max_x))
-    else:
-        print("no diff ckpt found")
-    return max_x
-    
-def load_differential_checkpoint(model, optimizer):
-    filedir = args.save_dir
-    _parameter_names = {name: param for name, param in model.named_parameters()}
-    iterations = find_max()
-    for i in range(0, iterations):
-        filepath = filedir + '/{}_{}_{}_{}_{}-{}_batch1.pth.tar'.format(args.model, args.dataset, args.compressor, args.compressor_ratio, args.resume-1, i)
-        tensor_compressed = torch.load(filepath)
-        for key in tensor_compressed.keys():  # the name for trainable params
-            tensor = topk_decompress(tensor_compressed[key]['values'], tensor_compressed[key]['indices'], tensor_compressed[key]['shape'])
-            param = _parameter_names.get(key)
-            if param is not None:
-                param.grad = tensor
-        optimizer.step()
-    return model, optimizer
-
-def load_batch_differential_checkpoint(model, optimizer):
-    filedir = args.save_dir
-    _parameter_names = {name: param for name, param in model.named_parameters()}
-    iterations = find_max()
-    for i in range(args.save_batch_freq-1, iterations, args.save_batch_freq):
-        filepath = filedir + '/{}_{}_{}_{}_{}-{}_batch{}.pth.tar'.format(args.model, args.dataset, args.compressor, args.compressor_ratio, args.resume-1, i, args.save_batch_freq)
-        tensor_compressed = torch.load(filepath)
-        for j in range(0, args.save_batch_freq):
-            for key in tensor_compressed[i-args.save_batch_freq+j+1].keys():  # the name for trainable params
-                tensor = topk_decompress(tensor_compressed[i-args.save_batch_freq+j+1][key]['values'], tensor_compressed[i-args.save_batch_freq+j+1][key]['indices'], tensor_compressed[i-args.save_batch_freq+j+1][key]['shape'])              
-                param = _parameter_names.get(key)
-                if param is not None:
-                    param.grad = tensor
-            optimizer.step()
-            print("loaded interation {}".format(i))
-    return model, optimizer
-
-def sync_model_optimizer_state(model, optimizer):
-    # Only execute synchronization on rank 0
-    if dist.get_rank() == 0:
-        # Broadcast model parameters
-        for param in model.parameters():
-            dist.broadcast(param.data, src=0)
-
-        # Broadcast optimizer state
-        for group in optimizer.param_groups:
-            for param in group['params']:
-                dist.broadcast(param.data, src=0)
-                
-    # Synchronize across all ranks
-    dist.barrier()
-
-def new_load_differential_checkpoint(model, optimizer, topk, args):
-    named_parameters = list(model.named_parameters())
-    _parameter_names = {v: k for k, v in sorted(named_parameters)}
-
-    thread_base = threading.Thread(target=base_plus_differential, args=(model, optimizer, _parameter_names, topk, args))
-    thread_diff = threading.Thread(target=differential_plus_differential,
-                                   args=(model, optimizer, _parameter_names, topk, args))
-
-    begin = time.time()
-    thread_base.start()
-    thread_diff.start()
-
-    thread_base.join()
-    thread_diff.join()
-
-    begin_temp = time.time()
-    optimizer.zero_grad()
-
-    for name, tensor in gradient_accumulation_group.items():
-        for param_group in optimizer.param_groups:
-            for p in param_group['params']:
-                if name == _parameter_names.get(p):
-                    p.grad = tensor
-                    break
-
-    optimizer.step()
-    end = time.time()
-    
-    return model, optimizer
-
-
-def base_plus_differential(model, optimizer, _parameter_names, topk, args):
-    begin = time.time()
-    optimizer.zero_grad()
-    checkpoint_index_parts = args.resume.split('-')
-    second_part = int(checkpoint_index_parts[1]) + 1
-    filepath = (args.save_dir + args.model + '_' + args.dataset + '_' + args.compressor + '_' +
-                str(args.compressor_ratio) + '_' + str(checkpoint_index_parts[0]) + '-' + str(
-                second_part) + '_diff.pth.tar')
-    tensor_compressed = torch.load(filepath)
-
-    for key in tensor_compressed.keys():
-        tensor = topk.decompress(tensor_compressed[key]['tensors'], tensor_compressed[key]['ctx'], None)
-        for param_group in optimizer.param_groups:
-            for p in param_group['params']:
-                name = _parameter_names.get(p)
-                if name == key:
-                    p.grad = tensor
-                    break
-    optimizer.step()
-    end = time.time()
-    cost_time = end - begin
-    print("loaded single differential checkpoint with base checkpoint cost {} time".format(cost_time))
-
-
-def differential_plus_differential(model, optimizer, _parameter_names, topk, args):
-    begin = time.time()
-    global gradient_accumulation_group
-    checkpoint_index_parts = args.resume.split('-')
-    for i in range(2, 10):
-        second_part = int(checkpoint_index_parts[1]) + i
-        filepath = ('{}/{}_{}_{}_{}_{}-{}_batch{}.pth.tar'.format(args.save_dir,args.model,args.dataset,args.compressor,args.compressor_ratio,epoch,batch_idx,args.save_batch_freq), batch_idx)
-        tensor_compressed = torch.load(filepath)
-        for key in tensor_compressed.keys():
-            tensor = topk.decompress(tensor_compressed[key]['tensors'], tensor_compressed[key]['ctx'], None)
-            for param_group in optimizer.param_groups:
-                for p in param_group['params']:
-                    name = _parameter_names.get(p)
-                    if name == key:
-                        if name not in gradient_accumulation_group:
-                            gradient_accumulation_group[name] = tensor.detach().clone()
-                        else:
-                            gradient_accumulation_group[name].add_(tensor)
-                        break
-
-    end = time.time()
-    cost_time = end - begin
-
-if __name__ == '__main__':
-    main()

@@ -11,9 +11,7 @@ MODEL=resnet50
 EPOCHS=10
 BATCH_SIZE=64
 FREQ=10
-SAVE_DIR=/save_dir
-RESUME=0
-DIFF=3
+SAVE_DIR=/data/dc
 
 # Distributed training with DeepSpeed
 deepspeed --hostfil=hostfile ./torch/DC.py \
